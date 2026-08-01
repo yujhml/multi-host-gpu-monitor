@@ -1,0 +1,18 @@
+# multi-host-gpu-monitor host list.
+# Copy to hosts.txt and edit:   cp hosts.example.txt hosts.txt
+#
+# One entry per line, '#' starts a comment. Names are resolved through
+# ~/.ssh/config, so ProxyJump / User / Port / ControlMaster settings there
+# apply automatically.
+#
+# The special name 'local' probes this machine directly, without ssh.
+#
+# Hosts that are unreachable, hung, or awaiting authentication (Tailscale
+# login, missing key, 2FA) are skipped silently. Run with --show-skipped to
+# see which, and why.
+
+local
+
+# gpu-a
+# gpu-b
+# lab-ws-03

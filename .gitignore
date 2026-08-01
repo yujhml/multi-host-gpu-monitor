@@ -1,0 +1,6 @@
+# Host lists are infrastructure-specific; keep yours local.
+hosts.txt
+
+__pycache__/
+*.py[cod]
+.DS_Store
