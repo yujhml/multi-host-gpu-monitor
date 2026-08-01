@@ -54,7 +54,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))  # realpath: survives a PATH 
 PROBE = os.path.join(HERE, "probe.py")
 DEFAULT_HOSTS = os.path.join(HERE, "hosts.txt")
 EXAMPLE_HOSTS = os.path.join(HERE, "hosts.example.txt")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SENTINEL = "@@GPUMON1@@"
 
 def remote_cmd(timeout):
@@ -166,6 +166,10 @@ MIN_PANEL = 34
 # The process table is never squeezed below this, even on a short terminal;
 # the device grid gives up lines first.
 MIN_PROC_ROWS = 3
+
+# Share of the process table given to your own processes; the rest goes to
+# everyone else's. Either section can borrow whatever the other cannot use.
+MINE_SHARE = 0.70
 
 
 def vlen(s):
@@ -308,13 +312,20 @@ def device_panel(host, wsl, g, hostinfo, width, c):
     # 100% means every core is busy rather than one core saturated.
     hi = hostinfo or {}
     cores, pct = hi.get("cores"), hi.get("cpu")
-    tasks, threads = hi.get("tasks"), hi.get("threads")
+    busy, tasks, threads = hi.get("cores_busy"), hi.get("tasks"), hi.get("threads")
     up = uptime_short(hi.get("uptime"))
+    # "5/20c" reads as five of twenty cores loaded, which distinguishes a few
+    # pinned threads from an evenly-busy machine at the same mean.
+    corestr = f"{opt(cores)}c" if busy is None else f"{busy}/{opt(cores)}c"
     if wide:
-        stats = (f" {opt(cores)}c  {opt(tasks)} tasks  {opt(threads)} thr"
+        stats = (f" {corestr}  {opt(tasks)} tasks  {opt(threads)} thr"
                  f"  up {up}")
     else:
-        stats = f" {opt(cores)}c {opt(tasks)}p {opt(threads)}t {up}"
+        stats = f" {corestr} {opt(tasks)}p {opt(threads)}t {up}"
+    # On a big machine (256 cores, five-digit thread counts) the text alone can
+    # exceed a narrow panel, so clip it before sizing the meter -- otherwise the
+    # meter bottoms out at its floor and the line spills past the panel edge.
+    stats = clip(stats, max(0, width - 12))
     meter = max(6, width - 6 - len(stats))
     label = "N/A" if pct is None else f"{pct:.1f}%"
     lines.append(f" CPU[{bar((pct or 0) / 100, meter, label, c)}]{stats}")
@@ -386,11 +397,12 @@ ESC_KEYS = {
     "[A": "up", "[B": "down", "[H": "home", "[F": "end",
     "OA": "up", "OB": "down", "OH": "home", "OF": "end",
     "[5~": "pgup", "[6~": "pgdn", "[1~": "home", "[4~": "end",
+    "[Z": "tab",                      # shift-tab, treated the same
 }
 PLAIN_KEYS = {
     "k": "up", "j": "down", "g": "home", "G": "end",
     "b": "pgup", " ": "pgdn", "u": "pgup", "d": "pgdn",
-    "q": "q",
+    "q": "q", "\t": "tab",
 }
 
 
@@ -645,12 +657,14 @@ class Collector:
 # ---------------------------------------------------------------------------
 
 def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
-           height=0, offset=0):
+           height=0, offsets=None, focus="mine"):
     """Render the full view.
 
-    Returns (text, total_rows, visible_rows, clamped_offset) so the caller
-    can bound scrolling against what actually fit.
+    Returns (text, meta) where meta maps each process section to
+    (total_rows, visible_rows, clamped_offset), so the caller can bound
+    scrolling against what actually fit.
     """
+    offsets = offsets or {}
     lines = []
     ngpu = sum(len(p.get("gpus", [])) for p in results.values())
     nproc = sum(len(p.get("procs", [])) for p in results.values())
@@ -664,7 +678,7 @@ def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
     # grid_lines are held back: if the terminal is shorter than the grid, they
     # get trimmed too, so the view never overflows into terminal scrollback.
 
-    # ---- unified process table -------------------------------------------
+    # ---- process table, split by ownership ---------------------------------
     rows = []
     for host in hosts:
         payload = results.get(host)
@@ -673,6 +687,12 @@ def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
         for p in payload.get("procs", []):
             rows.append((host, p))
     rows.sort(key=lambda r: (-(r[1].get("gpu_mem") or 0), -(r[1].get("cpu") or 0)))
+
+    # Ownership is decided on each host by the probe, against the account it
+    # runs as there -- the ssh user differs per machine, so it cannot be
+    # inferred from one local username.
+    mine_rows = [r for r in rows if r[1].get("mine")]
+    other_rows = [r for r in rows if not r[1].get("mine")]
 
     # Footer first: it competes with the process rows for the remaining lines,
     # so it has to be measured before deciding how many rows fit.
@@ -697,48 +717,71 @@ def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
     hdr = (f"  {'HOST':<{hostw}} {'PID':>8} {'USER':<10} {'DEV':>3} {'TYPE':<4} "
            f"{'GPU':>4} {'GPU MEM':>9} {'CPU':>6} {'HOST MEM':>9}  COMMAND")
 
+    sections = [("mine", "yours", mine_rows), ("others", "other users", other_rows)]
+    shown = [s for s in sections if s[2]]          # skip an empty section entirely
+
     # Split the available height between the device grid and the process rows.
     # `height <= 0` means "no limit" (piped output, or --once).
-    hidden_devices = 0
     if height and height > 0:
-        # status(2) + table header + rule + trailing blank + footer + 1 spare
-        fixed = len(lines) + 3 + len(footer) + 1
-        # Guarantee the process table at least a few rows, trimming the grid if
-        # the terminal is too short to show every device.
+        # status(2) + column header + rule + trailing blank + footer + 1 spare
+        fixed = len(lines) + 3 + len(footer) + 1 + len(shown)
+        # Guarantee the process table a few rows, trimming the grid if the
+        # terminal is too short to show every device.
         grid_budget = max(0, height - fixed - MIN_PROC_ROWS)
         if len(grid_lines) > grid_budget:
             per = grid_lines.index("") + 1 if "" in grid_lines else 1
             keep = max(0, (grid_budget - 1) // max(1, per) * max(1, per))
-            hidden_devices = len(grid_lines) - keep
-            grid_lines = grid_lines[:keep]
-            if hidden_devices > 0:
+            if len(grid_lines) - keep > 0:
+                grid_lines = grid_lines[:keep]
                 grid_lines.append(
                     f"{c['dim']}  ... device grid truncated to fit the terminal "
                     f"(use a taller window or -L stack){c['reset']}")
         capacity = max(1, height - (len(lines) + len(grid_lines) + 3
-                                    + len(footer) + 1))
+                                    + len(footer) + 1 + len(shown)))
     else:
         capacity = len(rows)
     lines.extend(grid_lines)
 
-    total = len(rows)
-    visible = min(capacity, total)
-    max_offset = max(0, total - visible)
-    offset = max(0, min(offset, max_offset))
+    # 70% of the rows go to your processes, 30% to everyone else. Whatever a
+    # section cannot use is handed to the other rather than left blank.
+    caps = {"mine": 0, "others": 0}
+    if len(shown) == 1:
+        caps[shown[0][0]] = capacity
+    elif shown:
+        caps["mine"] = max(1, int(round(capacity * MINE_SHARE)))
+        caps["others"] = max(1, capacity - caps["mine"])
+        for a, b in (("mine", "others"), ("others", "mine")):
+            spare = caps[a] - len(mine_rows if a == "mine" else other_rows)
+            if spare > 0:
+                caps[a] -= spare
+                caps[b] += spare
 
-    scroll = ""
-    if total > visible:
-        scroll = (f"{c['dim']}  rows {offset + 1}-{offset + visible} of {total}"
-                  f"  [↑/↓ PgUp/PgDn Home/End]{c['reset']}")
-    lines.append(f"{c['bold']}{hdr}{c['reset']}{scroll}")
+    lines.append(f"{c['bold']}{hdr}{c['reset']}")
     lines.append(c["dim"] + "-" * min(width, 200) + c["reset"])
 
     if not rows:
         lines.append(f"  {c['dim']}no GPU processes on any reachable host{c['reset']}")
-    else:
-        prefix = 2 + hostw + 1 + 8 + 1 + 10 + 1 + 3 + 1 + 4 + 1 + 4 + 1 + 9 + 1 + 6 + 1 + 9 + 2
-        cmdw = max(20, width - prefix)
-        for host, p in rows[offset:offset + visible]:
+
+    prefix = 2 + hostw + 1 + 8 + 1 + 10 + 1 + 3 + 1 + 4 + 1 + 4 + 1 + 9 + 1 + 6 + 1 + 9 + 2
+    cmdw = max(20, width - prefix)
+    meta = {}
+    for key, label, srows in sections:
+        total = len(srows)
+        visible = min(caps[key], total)
+        off = max(0, min(offsets.get(key, 0), max(0, total - visible)))
+        meta[key] = (total, visible, off)
+        if not total:
+            continue
+
+        marker = f"{c['bold']}▸{c['reset']}" if key == focus else " "
+        scroll = ""
+        if total > visible:
+            scroll = f"  rows {off + 1}-{off + visible} of {total}"
+        lines.append(
+            f"{marker} {c['bold']}{label}{c['reset']}{c['dim']} ({total})"
+            f"{scroll}{c['reset']}"
+        )
+        for host, p in srows[off:off + visible]:
             cmd = p.get("cmd", "?")
             if len(cmd) > cmdw:
                 cmd = cmd[:cmdw - 1] + "~"
@@ -746,9 +789,10 @@ def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
             gmem = p.get("gpu_mem")
             gcol = c["cyan"] if p.get("self_reported") else ""
             tcol = c["green"] if p.get("type", "C").startswith("C") else c["blue"]
+            ucol = c["bold"] if p.get("mine") else c["dim"]
             lines.append(
                 f"  {c['magenta']}{host:<{hostw}}{c['reset']} {p['pid']:>8} "
-                f"{clip(str(p.get('user', '?')), 10):<10} "
+                f"{ucol}{clip(str(p.get('user', '?')), 10):<10}{c['reset']} "
                 f"{('-' if p.get('dev') is None else p['dev']):>3} "
                 f"{tcol}{p.get('type', 'C'):<4}{c['reset']} "
                 f"{('-' if sm is None else f'{sm}%'):>4} "
@@ -758,7 +802,7 @@ def render(results, skipped, hosts, width, c, show_skipped, layout='auto',
 
     lines.append("")
     lines.extend(footer)
-    return "\n".join(lines), total, visible, offset
+    return "\n".join(lines), meta
 
 
 # ---------------------------------------------------------------------------
@@ -852,8 +896,8 @@ def main():
         # height-limited: print every process row.
         results, skipped = collector.poll()
         width = shutil.get_terminal_size((160, 40)).columns
-        out, _total, _vis, _off = render(results, skipped, hosts, width, c,
-                                         args.show_skipped, args.layout)
+        out, _meta = render(results, skipped, hosts, width, c,
+                            args.show_skipped, args.layout)
         print(out)
         return 0
 
@@ -869,7 +913,8 @@ def main():
         except (ValueError, OSError):
             pass
 
-    offset = 0
+    offsets = {"mine": 0, "others": 0}
+    focus = "mine"
     results, skipped = {}, {}
     next_poll = 0.0
     dirty = True
@@ -884,10 +929,12 @@ def main():
 
                 if dirty:
                     size = shutil.get_terminal_size((160, 40))
-                    out, total, visible, offset = render(
+                    out, meta = render(
                         results, skipped, hosts, size.columns, c,
                         args.show_skipped, args.layout,
-                        height=size.lines, offset=offset)
+                        height=size.lines, offsets=offsets, focus=focus)
+                    for k, (_t, _v, clamped) in meta.items():
+                        offsets[k] = clamped
                     sys.stdout.write("\033[H\033[J" + out + "\n")
                     sys.stdout.flush()
                     dirty = False
@@ -898,10 +945,15 @@ def main():
                 key = keys.get(budget)
                 if key in ("q", "esc"):
                     break
-                if key:
-                    new = scroll_to(key, offset, visible, total)
-                    if new != offset:
-                        offset, dirty = new, True
+                if key == "tab":
+                    # Scrolling acts on one section at a time; Tab picks which.
+                    focus = "others" if focus == "mine" else "mine"
+                    dirty = True
+                elif key:
+                    total, visible, _off = meta.get(focus, (0, 0, 0))
+                    new = scroll_to(key, offsets[focus], visible, total)
+                    if new != offsets[focus]:
+                        offsets[focus], dirty = new, True
     except KeyboardInterrupt:
         pass
     finally:

@@ -79,11 +79,13 @@ gpu-monitor --close          # tear down the persistent ssh masters
 
 | key | |
 |-----|---|
-| `↑` / `↓`, or `k` / `j` | scroll the process table one row |
+| `↑` / `↓`, or `k` / `j` | scroll the focused section one row |
 | `PgUp` / `PgDn`, or `b` / `space` | one page |
 | `Home` / `End`, or `g` / `G` | top / bottom |
+| `Tab` | move focus between **yours** and **other users** |
 | `q` or `Esc` | quit |
 
+Each section scrolls independently, and `▸` marks the one the keys act on.
 Scrolling redraws immediately from the last poll rather than waiting for the
 next refresh, so it stays responsive even at a long `--delay`.
 
@@ -142,6 +144,28 @@ The process table takes whatever height the grid and footer leave. On a
 terminal too short to show every GPU the **grid** is truncated first — the
 table is never squeezed below three rows. If the table feels cramped, trading
 grid columns for rows (`-L 9x3`) helps more than `-L stack` does.
+
+### Yours vs everyone else
+
+The process table is split in two, with **70% of the available rows given to
+your own processes** and 30% to everybody else's:
+
+```
+▸ yours (3)
+  gpu-a     174786 you          1 C   99%   158.0M  100.0   727.9M  python -m mypkg.train~
+  other users (18)  rows 1-6 of 18
+  gpu-b    3650571 someone      0 C   81%     9.2G  256.7     2.0G  python scripts/train.py~
+```
+
+Ownership is decided **on each host** by the probe, comparing each process
+against the account it is running as there. That matters on a cluster where
+your ssh user differs from your local username — it cannot be worked out by
+comparing against one local name.
+
+Whatever a section cannot fill is handed to the other rather than left blank,
+so three processes of yours plus twenty of everyone else's gives 3 + 8 rather
+than 8 + 3. If one side is empty its heading disappears entirely. Adjust the
+split with `MINE_SHARE` near the top of `gpu-monitor`.
 
 ### Speed
 

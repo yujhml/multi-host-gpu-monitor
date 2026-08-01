@@ -70,6 +70,9 @@ def arm_deadline():
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 NVML_NOT_AVAILABLE = 2**64 - 1
+# A core at or above this counts as "busy" for the loaded-core tally.
+BUSY_CORE_PCT = 50.0
+MY_UID = os.getuid()
 
 
 def sh(cmd, timeout):
@@ -299,30 +302,58 @@ def apply_wsl_reports(procs):
 # ---------------------------------------------------------------------------
 
 def read_cpu_times():
-    """(busy+idle, idle) jiffies from /proc/stat's aggregate `cpu` line."""
+    """Per-core (busy+idle, idle) jiffy counters from /proc/stat.
+
+    Fields are truncated at `steal`: `guest` and `guest_nice` are already
+    counted inside `user` and `nice`, so including them would double-count
+    guest time on a VM.
+    """
+    cores = []
     try:
         with open("/proc/stat") as fh:
-            fields = [int(x) for x in fh.readline().split()[1:9]]
+            for line in fh:
+                if not line.startswith("cpu"):
+                    break
+                if line.startswith("cpu "):
+                    continue            # aggregate line; per-core is enough
+                # user nice system idle iowait irq softirq steal
+                f = [int(x) for x in line.split()[1:9]]
+                cores.append((sum(f), f[3] + f[4]))
     except (OSError, ValueError, IndexError):
         return None
-    # user nice system idle iowait irq softirq steal
-    return sum(fields), fields[3] + fields[4]
+    return cores or None
+
+
+def core_percent(before, after):
+    """Per-core usage over the window, skipping cores that did not tick."""
+    out = []
+    for (t0, i0), (t1, i1) in zip(before, after):
+        d_total, d_idle = t1 - t0, i1 - i0
+        if d_total > 0:
+            out.append(max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total))))
+    return out
 
 
 def host_summary(cpu0, cpu1):
     """Whole-machine context: cores, load, task/thread counts, uptime.
 
-    CPU usage is normalised across all cores, so 100% means every core is
-    busy -- not one core saturated. It is derived from the same two samples
-    that bracket the per-process window, so it costs no extra wall clock.
+    CPU usage is the mean of the per-core percentages, so 100% means every
+    core is busy -- not one core saturated. It is derived from the same two
+    samples that bracket the per-process window, so it costs no extra wall
+    clock. (The mean matches the aggregate `cpu` line to within ~0.1pp; the
+    per-core read is what makes the loaded-core count available.)
     """
-    info = {"cores": os.cpu_count(), "cpu": None, "tasks": None,
-            "threads": None, "uptime": None}
+    info = {"cores": os.cpu_count(), "cpu": None, "cores_busy": None,
+            "tasks": None, "threads": None, "uptime": None}
     if cpu0 and cpu1:
-        d_total = cpu1[0] - cpu0[0]
-        d_idle = cpu1[1] - cpu0[1]
-        if d_total > 0:
-            info["cpu"] = max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+        per_core = core_percent(cpu0, cpu1)
+        if per_core:
+            info["cores"] = len(per_core)
+            info["cpu"] = sum(per_core) / len(per_core)
+            # How many cores are actually loaded. 30% across 20 cores is a very
+            # different machine depending on whether it is 6 cores pinned or all
+            # 20 lightly busy, and the mean alone cannot tell them apart.
+            info["cores_busy"] = sum(1 for x in per_core if x >= BUSY_CORE_PCT)
     try:
         info["tasks"] = sum(1 for e in os.listdir("/proc") if e.isdigit())
     except OSError:
@@ -394,12 +425,19 @@ def enrich(procs):
 
         try:
             uid = os.stat(f"/proc/{pid}").st_uid
-            user = pwd.getpwuid(uid).pw_name
-        except (OSError, KeyError):
-            user = "?"
+        except OSError:
+            uid = None
+        try:
+            user = pwd.getpwuid(uid).pw_name if uid is not None else "?"
+        except KeyError:
+            user = str(uid)
+        # "Mine" is decided here, on the host, against the account the probe
+        # runs as. That is the ssh user for this host, which differs per
+        # machine, so the collector cannot work it out from one local username.
+        mine = uid is not None and uid == MY_UID
 
         out.append({
-            "pid": pid, "user": user, "dev": info.get("dev"),
+            "pid": pid, "user": user, "mine": mine, "dev": info.get("dev"),
             "type": info.get("type", "C"), "sm": info.get("sm"),
             "gpu_mem": info.get("gpu_mem"), "cpu": cpu, "rss": rss,
             "cmd": cmd, "self_reported": info.get("self_reported", False),
