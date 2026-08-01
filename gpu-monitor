@@ -54,7 +54,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))  # realpath: survives a PATH 
 PROBE = os.path.join(HERE, "probe.py")
 DEFAULT_HOSTS = os.path.join(HERE, "hosts.txt")
 EXAMPLE_HOSTS = os.path.join(HERE, "hosts.example.txt")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SENTINEL = "@@GPUMON1@@"
 
 def remote_cmd(timeout):
@@ -214,6 +214,20 @@ def grid_shape(n, spec, width):
     return rows, cols, panel_w
 
 
+def uptime_short(seconds):
+    """Compact uptime: 12d4h / 4h12m / 12m."""
+    if seconds is None:
+        return "?"
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    mins = rest // 60
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{mins}m"
+    return f"{mins}m"
+
+
 def short_name(name):
     """'NVIDIA GeForce RTX 2080 Ti' -> 'RTX 2080 Ti', for narrow panels."""
     for prefix in ("NVIDIA GeForce ", "NVIDIA TITAN ", "NVIDIA "):
@@ -234,7 +248,7 @@ def rate_short(bytes_per_s):
     return f"{v:.1f}G"
 
 
-def device_panel(host, wsl, g, width, c):
+def device_panel(host, wsl, g, hostinfo, width, c):
     """One GPU's nvtop block, laid out to fit exactly `width` columns.
 
     Every panel is a single device, so all cells in the grid have the same
@@ -244,6 +258,10 @@ def device_panel(host, wsl, g, width, c):
     Wide panels get the full nvtop one-liner. Narrow ones reflow onto extra
     lines rather than truncating, so PCIe/RX/TX survive a many-column grid
     instead of being cut off the right-hand edge.
+
+    The trailing CPU line describes the whole machine, not the device, so on a
+    multi-GPU host it repeats in each of that host's panels. That is deliberate:
+    every panel stays the same height, which is what keeps the grid rectangular.
     """
     lines = []
     head = f"{host}{' (wsl)' if wsl else ''}"
@@ -285,6 +303,21 @@ def device_panel(host, wsl, g, width, c):
         meter = max(8, width - 6)
         lines.append(f" GPU[{bar(util / 100, meter, f'{util}%', c)}]")
         lines.append(f" MEM[{bar(used / total, meter, memlabel, c)}]")
+
+    # Whole-machine CPU context. Usage is normalised across all cores, so
+    # 100% means every core is busy rather than one core saturated.
+    hi = hostinfo or {}
+    cores, pct = hi.get("cores"), hi.get("cpu")
+    tasks, threads = hi.get("tasks"), hi.get("threads")
+    up = uptime_short(hi.get("uptime"))
+    if wide:
+        stats = (f" {opt(cores)}c  {opt(tasks)} tasks  {opt(threads)} thr"
+                 f"  up {up}")
+    else:
+        stats = f" {opt(cores)}c {opt(tasks)}p {opt(threads)}t {up}"
+    meter = max(6, width - 6 - len(stats))
+    label = "N/A" if pct is None else f"{pct:.1f}%"
+    lines.append(f" CPU[{bar((pct or 0) / 100, meter, label, c)}]{stats}")
     return lines
 
 
@@ -302,12 +335,12 @@ def render_grid(results, hosts, spec, width, c):
             continue
         wsl = payload.get("host_kind") == "wsl"
         for g in payload.get("gpus", []):
-            devices.append((host, wsl, g))
+            devices.append((host, wsl, g, payload.get("host")))
     if not devices:
         return [], "0x0"
 
     rows, cols, panel_w = grid_shape(len(devices), spec, width)
-    panels = [device_panel(h, w, g, panel_w, c) for h, w, g in devices]
+    panels = [device_panel(h, w, g, hi, panel_w, c) for h, w, g, hi in devices]
 
     out = []
     for r in range(rows):

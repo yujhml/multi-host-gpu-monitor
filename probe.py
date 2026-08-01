@@ -298,6 +298,50 @@ def apply_wsl_reports(procs):
 # /proc enrichment: user, cpu%, host memory, command
 # ---------------------------------------------------------------------------
 
+def read_cpu_times():
+    """(busy+idle, idle) jiffies from /proc/stat's aggregate `cpu` line."""
+    try:
+        with open("/proc/stat") as fh:
+            fields = [int(x) for x in fh.readline().split()[1:9]]
+    except (OSError, ValueError, IndexError):
+        return None
+    # user nice system idle iowait irq softirq steal
+    return sum(fields), fields[3] + fields[4]
+
+
+def host_summary(cpu0, cpu1):
+    """Whole-machine context: cores, load, task/thread counts, uptime.
+
+    CPU usage is normalised across all cores, so 100% means every core is
+    busy -- not one core saturated. It is derived from the same two samples
+    that bracket the per-process window, so it costs no extra wall clock.
+    """
+    info = {"cores": os.cpu_count(), "cpu": None, "tasks": None,
+            "threads": None, "uptime": None}
+    if cpu0 and cpu1:
+        d_total = cpu1[0] - cpu0[0]
+        d_idle = cpu1[1] - cpu0[1]
+        if d_total > 0:
+            info["cpu"] = max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+    try:
+        info["tasks"] = sum(1 for e in os.listdir("/proc") if e.isdigit())
+    except OSError:
+        pass
+    try:
+        with open("/proc/loadavg") as fh:
+            # field 4 is running/total kernel scheduling entities: the second
+            # number is the thread count, far cheaper than summing /proc/*/status
+            info["threads"] = int(fh.read().split()[3].split("/")[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open("/proc/uptime") as fh:
+            info["uptime"] = float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
+
+
 def proc_stat(pid):
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
@@ -316,9 +360,11 @@ def enrich(procs):
     samples here -- inside the probe -- and return the delta. One round trip.
     """
     pids = {pid for pid, _dev in procs}
+    cpu0 = read_cpu_times()
     first = {pid: proc_stat(pid) for pid in pids}
     time.sleep(CPU_WINDOW)
     second = {pid: proc_stat(pid) for pid in pids}
+    cpu1 = read_cpu_times()
 
     out = []
     for (pid, _dev), info in procs.items():
@@ -358,7 +404,7 @@ def enrich(procs):
             "gpu_mem": info.get("gpu_mem"), "cpu": cpu, "rss": rss,
             "cmd": cmd, "self_reported": info.get("self_reported", False),
         })
-    return out
+    return out, host_summary(cpu0, cpu1)
 
 
 def main():
@@ -380,11 +426,13 @@ def main():
         procs = query_compute_apps(uuid_to_index)
         query_pmon(procs)
 
+    proc_rows, host = enrich(procs)
     payload = {
         "host_kind": kind,
         "ts": time.time(),
+        "host": host,
         "gpus": [{k: v for k, v in g.items() if k != "uuid"} for g in gpus],
-        "procs": enrich(procs),
+        "procs": proc_rows,
     }
     print(SENTINEL + json.dumps(payload))
     return 0

@@ -15,6 +15,7 @@ gpu-a · Dev 0 [RTX 3090]                 gpu-b · Dev 1 [RTX 2080 Ti]
  1755/9501MHz 46°C 31% 224/350W           300/405MHz 26°C 22% 18/100W
  GPU[|||||||||||||||||||||||     71%]     GPU[                        0%]
  MEM[||||||||||||||  13.2Gi/24.0Gi]       MEM[               0.009Gi/11.0Gi]
+ CPU[|||||     31.4%] 32c 412p 1980t 6d2h CPU[|      5.7%] 20c 380p 448t 2d14h
 
   HOST         PID USER       DEV TYPE  GPU   GPU MEM    CPU  HOST MEM  COMMAND
   gpu-a    3522167 alice        0 C     70%      9.2G  251.7      2.0G  python train.py --config resnet50 --epochs 200~
@@ -118,6 +119,24 @@ PCIe/RX/TX onto its own line and shortens the GPU name
 
 Because the shape follows the devices that are *up*, it changes when a host
 comes or goes. Pin it with `-L RxC` if you want it stable.
+
+### The CPU line
+
+Each panel ends with the state of the machine the GPU is in:
+
+```
+ CPU[|||||     31.4%] 32c  412 tasks  1980 thr  up 6d2h     (wide panel)
+ CPU[|||    31.4%] 32c 412p 1980t 6d2h                      (narrow panel)
+```
+
+Usage is **normalised across all cores**, so 100% means every core is busy, not
+one core saturated. It comes from two `/proc/stat` samples bracketing the same
+window used for per-process CPU%, so it costs no extra wall clock. Tasks are
+processes; threads come from `/proc/loadavg`.
+
+This describes the host, not the device, so on a multi-GPU machine it repeats
+in each of that host's panels — deliberately, because equal-height panels are
+what keep the grid rectangular.
 
 The process table takes whatever height the grid and footer leave. On a
 terminal too short to show every GPU the **grid** is truncated first — the
