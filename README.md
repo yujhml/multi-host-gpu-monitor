@@ -122,6 +122,13 @@ PCIe/RX/TX onto its own line and shortens the GPU name
 Because the shape follows the devices that are *up*, it changes when a host
 comes or goes. Pin it with `-L RxC` if you want it stable.
 
+Hosts alternate between two colours so neighbours are easy to separate, in both
+the grid and the process table. Parity is taken over the hosts actually
+**displayed**, not the order in `hosts.txt` — otherwise a skipped host would put
+two neighbours on the same colour. Since a host keeps its colour across all of
+its panels, a two-GPU machine shows as an adjacent same-coloured pair. Change
+the pair via `HOST_COLORS` near the top of `gpu-monitor`.
+
 ### The CPU line
 
 Each panel ends with the state of the machine the GPU is in:
