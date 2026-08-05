@@ -54,7 +54,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))  # realpath: survives a PATH 
 PROBE = os.path.join(HERE, "probe.py")
 DEFAULT_HOSTS = os.path.join(HERE, "hosts.txt")
 EXAMPLE_HOSTS = os.path.join(HERE, "hosts.example.txt")
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 SENTINEL = "@@GPUMON1@@"
 
 def remote_cmd(timeout):
@@ -581,7 +581,11 @@ class Collector:
     The failure table is persisted. Without that, backoff would only help a
     long-running pane: every `--once` invocation would start cold and pay a
     full timeout for each dead host, which is precisely the case where waiting
-    12s for a one-line answer is most annoying.
+    out a timeout for a one-line answer is most annoying.
+
+    That matters more the larger --timeout is: poll() joins its pool, so a dead
+    host stalls the display for a whole timeout every --retry-after seconds.
+    The two defaults are chosen together.
     """
 
     def __init__(self, hosts, timeout, workers, retry_after, use_cache=True):
@@ -847,12 +851,12 @@ def main():
                     help=f"host list file (default: {DEFAULT_HOSTS})")
     ap.add_argument("-d", "--delay", type=float, default=3.0,
                     help="refresh interval in seconds (default: 3)")
-    ap.add_argument("-t", "--timeout", type=float, default=12.0,
-                    help="per-host hard timeout in seconds (default: 12)")
+    ap.add_argument("-t", "--timeout", type=float, default=30.0,
+                    help="per-host hard timeout in seconds (default: 30)")
     ap.add_argument("-j", "--workers", type=int, default=16,
                     help="max concurrent probes (default: 16)")
-    ap.add_argument("--retry-after", type=float, default=45.0,
-                    help="seconds before re-probing a failed host (default: 45)")
+    ap.add_argument("--retry-after", type=float, default=120.0,
+                    help="seconds before re-probing a failed host (default: 120)")
     ap.add_argument("-1", "--once", action="store_true", help="print once and exit")
     ap.add_argument("--show-skipped", action="store_true",
                     help="show why each host was skipped")

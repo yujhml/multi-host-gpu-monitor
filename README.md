@@ -67,7 +67,7 @@ runs.
 gpu-monitor                  # live, refreshes every 3s
 gpu-monitor -1               # print once and exit (never height-limited)
 gpu-monitor --show-skipped   # explain why hosts were hidden
-gpu-monitor -d 5 -t 20       # 5s refresh, 20s per-host timeout
+gpu-monitor -d 5 -t 45       # 5s refresh, 45s per-host timeout
 gpu-monitor -f other.txt     # a different host list
 gpu-monitor -L stack         # one full-width column
 gpu-monitor -L 3x5           # explicit grid
@@ -174,17 +174,42 @@ so three processes of yours plus twenty of everyone else's gives 3 + 8 rather
 than 8 + 3. If one side is empty its heading disappears entirely. Adjust the
 split with `MINE_SHARE` near the top of `gpu-monitor`.
 
-### Speed
+### Speed and timeouts
+
+The first probe of a host also builds its ssh connection; every later one
+reuses it. On a 15-host fleet that is the difference between:
+
+```
+cold (no ssh masters)   25.9 s
+warm                     4.2 s
+```
+
+`--timeout` therefore has to cover a *cold* connection, not a warm probe. That
+is what the 30s default is sized for, and it is why a shorter one fails so
+badly: if the timeout is under the cold-connect cost, the first sweep times
+out, every host is cached as failed, and each retry times out in exactly the
+same way — the tool can never establish the connections that would make it
+fast. The same fleet at `-t 12` shows 2 of 15 hosts.
+
+If your cold connections are slow, measure before raising the timeout further:
+
+```bash
+time ssh -o ControlPath=none -o ControlMaster=no somehost true
+```
+
+A frequent cause on university and lab clusters is `GSSAPIAuthentication`,
+which stalls ~10s per attempt when there is no Kerberos ticket to be found. On
+the fleet this was developed against it cost 20s of every 21s cold connect —
+`GSSAPIAuthentication no` under `Host *` in `~/.ssh/config` took that to under
+a second. It is left to ssh config rather than forced here, since some sites
+genuinely authenticate that way.
 
 A dead host costs a full timeout, so failures are remembered in
 `~/.cache/gpu-monitor/failed.json` and re-probed only every `--retry-after`
-seconds (default 45). On a fleet with two unreachable hosts that is the
-difference between:
-
-```
-cold (no cache)   12.0 s
-warm               2.6 s
-```
+seconds (default 120). The two defaults are chosen together: a poll waits for
+all of its hosts, so a down host stalls the display for `--timeout` seconds
+once per `--retry-after`. Raising one without the other makes an outage far
+more visible than it needs to be.
 
 The cache stores *when* a host failed rather than when to retry it, so changing
 `--retry-after` takes effect immediately for hosts already in it. A host that
